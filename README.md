@@ -4,7 +4,7 @@ It is easy to be customized to fulfill your own demands. All you need to do is t
  For your information, I put some data loaders I often use in the "datasets" folder, such as "folderlist.py" (loading images in a given folder), "filelist.py" (loading images in a file list written in a text file), "triplet.py" (loading images as triplets), and so on.
  2. **Network Architecture**: uses a nn.Module class to define your neural network.
  I put some well-kown networks in face recognition domain in the "models" folder, such as "resnet.py" (ResNet), sphereface.py" (SphereFace), "arcface.py" (ArcFace)
- The main model in the paper is ",span style="color:red">gac.py</span>".
+ The main model in the paper is "<span style="color:red">gac.py</span>".
  If you want to check how do I use spatial and channel-wise attention, you can go to "\textcolor{red}{attdemog.py}".
  3. **Loss Method**: Pytorch provides some comman loss functions in torch.nn library, for example CrossEntropyLoss or MSELoss. And you can also design your own loss function by using a nn.Module class, which is similary to writting a network architecture.
  Still, there are some loss functions I wrote for face recognition and shoe image retrieval, that can be found in "losses" folder.
