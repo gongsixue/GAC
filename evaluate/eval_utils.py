@@ -82,10 +82,10 @@ def read_pairfile(pairs_filename, dataset):
     pairs = []
     with open(pairs_filename, 'r') as f:
         if dataset == 'LFW':
-            for line in f.readlines()[0:]:
+            for line in f.readlines()[1:]:
                 pair = line.strip().split()
                 pairs.append(pair)
-        elif dataset == 'RFW':
+        elif dataset == 'RFW' or dataset == 'RFW_one_race':
             for line in f.readlines()[0:]:
                 pair = line.strip().split()
                 pairs.append(pair)

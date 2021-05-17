@@ -13,32 +13,13 @@ import torch.nn.functional as F
 import pdb
 
 class Tester:
-    def __init__(self, args, model, criterion, evaluation):
+    def __init__(self, args, model, evaluation, writer):
         self.args = args
         self.model = model
-        self.criterion = criterion
         self.evaluation = evaluation
+        self.writer = writer
 
         self.nepochs = args.nepochs
-
-        self.module_list = nn.ModuleList([self.model, self.criterion])
-        self.optimizer = getattr(optim, args.optim_method)(
-            self.module_list.parameters(), lr=args.learning_rate, **args.optim_options)
-
-        # for classification
-        self.labels = torch.zeros(args.batch_size).long()
-        self.inputs = torch.zeros(
-            args.batch_size,
-            args.resolution_high,
-            args.resolution_wide
-        )
-
-        if args.cuda:
-            self.labels = self.labels.cuda()
-            self.inputs = self.inputs.cuda()
-
-        self.inputs = Variable(self.inputs)
-        self.labels = Variable(self.labels)
 
         # logging testing
         self.log_loss = plugins.Logger(
@@ -46,43 +27,31 @@ class Tester:
             'TestLogger.txt',
             args.save_results
         )
-        params_loss = ['Test_Result']
-        self.log_loss.register(params_loss)
+        self.params_log = ['ACC', 'STD']
+        self.log_loss.register(self.params_log)
 
         # monitor testing
         self.monitor = plugins.Monitor()
-        self.params_monitor = {
-            params_loss[0]: {'dtype': 'running_mean'},
-        }
+        self.params_monitor = {}
+        for param in self.params_log:
+            self.params_monitor.update(
+                {param: {'dtype': 'running_mean'}})
         self.monitor.register(self.params_monitor)
-
-        # visualize testing
-        self.visualizer = plugins.Visualizer(args.port, args.env, 'Test')
-        params_visualizer = {
-            params_loss[0]: {'dtype': 'scalar', 'vtype': 'plot', 'win': 'acc',
-                    'layout': {'windows': ['train', 'test'], 'id': 1}},
-            # 'Test_Image': {'dtype': 'image', 'vtype': 'image',
-            #                'win': 'test_image'},
-            # 'Test_Images': {'dtype': 'images', 'vtype': 'images',
-            #                 'win': 'test_images'},
-        }
-        self.visualizer.register(params_visualizer)
 
         # display training progress
         self.print_formatter = 'Test [%d/%d]] '
-        for item in [params_loss[0]]:
+        for item in self.params_log:
             self.print_formatter += item + " %.4f "
 
-        self.losses = {params_loss[0]:0.0}
-        # self.binage = torch.Tensor([19,37.5,52.5,77])
+        self.losses = {}
 
     def model_eval(self):
         self.model.eval()
 
-    def test(self, epoch, dataloader):
+    def test(self, dataloader, epoch):
         dataloader = dataloader['test']
+        torch.cuda.empty_cache()
         self.monitor.reset()
-        # torch.cuda.empty_cache()
 
         # switch to eval mode
         self.model_eval()
@@ -102,74 +71,69 @@ class Tester:
             # Evaluate Network
             ############################
 
-            self.inputs.data.resize_(inputs.size()).copy_(inputs)
-            self.labels.data.resize_(input_labels.size()).copy_(input_labels)
-
-            # attrs = attrs[1] # demographic labels
+            input_labels = input_labels.long()
             attrs = attrs.long()
             if self.args.cuda:
+                inputs = inputs.cuda()
                 attrs = attrs.cuda()
-            attrs = Variable(attrs)
 
-            embeddings,_,_ = self.model(self.inputs, attrs, epoch)
-            # embeddings = self.model(self.inputs)
+            if self.args.train == 'base':
+                embeddings,_ = self.model(inputs)
+            elif self.args.train == 'gac':
+                embeddings,_ = self.model((inputs, attrs), epoch)
 
             feat_time = time.time() - end
             
             features.append(embeddings.data.cpu().numpy())
             labels.append(input_labels.data.numpy())
 
-            torch.sum(embeddings).backward()
+            # clear memorise of network gradients
+            # pdb.set_trace()
+            # torch.sum(embeddings).backward()
 
         labels = np.concatenate(labels, axis=0)
         features = np.concatenate(features, axis=0)
-        results,mean,_ = self.evaluation(features)
+        avg,std,_ = self.evaluation(features)
         
-        self.losses[list(self.losses)[0]] = results
+        self.losses['ACC'] = avg
+        self.losses['STD'] = std
         batch_size = 1
         self.monitor.update(self.losses, batch_size)
 
         # print batch progress
         print(self.print_formatter % tuple(
             [epoch + 1, self.nepochs] +
-            [results]))
+            [self.losses[key] for key in self.params_monitor]))
             
         # update the log file
         loss = self.monitor.getvalues()
         self.log_loss.update(loss)
 
-        # update the visualization
-        self.visualizer.update(loss)
+        if self.args.save_results:
+            for key in self.params_log:           
+                self.writer.add_scalar(key, loss[key], epoch)
 
-        # np.savez('/research/prip-gongsixu/codes/biasface/results/model_analysis/result_agel20.npz',
-        #     preds=preds.cpu().numpy(), labels=labels.cpu().numpy())
-
-        return results,mean
+        return avg,std
 
     def extract_features(self, dataloader, epoch):
         dataloader = dataloader['test']
         self.model_eval()
 
-        end = time.time()
-
         # extract features
-        filenames = []
         for i, (inputs,testlabels,attrs,fmetas) in enumerate(dataloader):
-
-            self.inputs.data.resize_(inputs.size()).copy_(inputs)
-
-            # attrs = attrs[1] # demographic labels
-            # attrs = torch.LongTensor(attrs)
             attrs = attrs.long()
             if self.args.cuda:
+                inputs = inputs.cuda()
                 attrs = attrs.cuda()
-            attrs = Variable(attrs)
 
             self.model.zero_grad()
-            # outputs = self.model(self.inputs)
-            outputs,_,_ = self.model(self.inputs, attrs)
-            # outputs,_,_ = self.model(self.inputs, attrs, epoch)
+            
+            if self.args.train == 'base':
+                outputs = self.model(inputs)
+            elif self.args.train == 'gac':
+                outputs,_,_ = self.model(inputs, attrs)
 
+            # clear memorise of network gradients
             torch.sum(outputs).backward()
             
             if i == 0:
@@ -178,9 +142,6 @@ class Tester:
             else:
                 embeddings = np.concatenate((embeddings, outputs.data.cpu().numpy()), axis=0)
                 labels = np.concatenate((labels, testlabels.numpy()), axis=0)
-
-        data_time = time.time() - end
-        print(data_time)
         
         labels = labels.reshape(-1)
 
@@ -189,6 +150,3 @@ class Tester:
         if os.path.isdir(subdir) is False:
             os.makedirs(subdir)
         np.savez(self.args.feat_savepath, feat=embeddings, label=labels)
-        # with open(os.path.splitext(self.args.feat_savepath)[0]+'_list.txt','w') as f:
-        #     for filename in filenames:
-        #         f.write(filename+'\n')

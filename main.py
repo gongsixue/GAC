@@ -9,23 +9,25 @@ import utils
 from model import Model
 from dataloader import Dataloader
 from checkpoints import Checkpoints
+
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 
 from itertools import combinations
+from ptflops import get_model_complexity_info
+from thop import profile
+import numpy as np
 
-args, config_file = config.parse_args()
-# Data Loading    
-if args.train == 'face_cls':
-    from test_cls import Tester
-    from train_cls import Trainer
-
-if args.train == 'face_margin':
-    from test_margin import Tester
-    from train_margin import Trainer
+args, config_file = config.parse_args()    
+from test_cls import Tester
+from train_cls import Trainer
 
 if args.dataset_train == 'ClassSamplesDataLoader':
     from train_classload import Trainer
 
+import pdb
 
 def main():
     # parse the arguments
@@ -39,11 +41,11 @@ def main():
 
     # Create Model
     models = Model(args)
-    model, model_dict, evaluation = models.setup(checkpoints)
+    model_dict, evaluation = models.setup(checkpoints)
 
-    print('Model:\n\t{model}\nTotal params:\n\t{npar:.2f}M'.format(
+    print('Model:\n\t{model}\nTotal params:\n\t{npar:.4f}M'.format(
           model=args.model_type,
-          npar=sum(p.numel() for p in model.parameters()) / 1000000.0))
+          npar=sum(p.numel() for p in model_dict['model'].parameters()) / 1000000.0))
 
     #### get kernel information ####
     ndemog = args.ndemog
@@ -51,10 +53,17 @@ def main():
     demog_combs = list(combinations(ndemog, 2))
     #### get kernel information ####
 
+    #### create writer for tensor boader ####
+    if args.save_results:
+        writer = SummaryWriter(args.tblog_dir)
+    else:
+        writer = None
+    #### create writer for tensor boader ####
+
     # The trainer handles the training loop
-    trainer = Trainer(args, model, model_dict['loss'], evaluation, model_dict['optimizer'])
+    trainer = Trainer(args, model_dict['model'], model_dict['loss'], model_dict['optimizer'], writer)
     # The trainer handles the evaluation on validation set
-    tester = Tester(args, model, model_dict['loss'], evaluation)
+    tester = Tester(args, model_dict['model'], evaluation, writer)
 
     test_freq = 1
 
@@ -65,12 +74,13 @@ def main():
         tester.extract_features(loaders, 1)
     elif args.just_test:
         loaders  = dataloader.create(flag='Test')
-        acc_test,acc_mean = tester.test(args.epoch_number, loaders, 1)
+        acc_test,acc_mean = tester.test(loaders, 1)
         print(acc_test, acc_mean)
     else:
         loaders  = dataloader.create()
         if args.dataset_train == 'ClassSamplesDataLoader':
             loaders['train'] = dataloader.dataset_train
+
         # start training !!!
         acc_best = 0
         loss_best = 999
@@ -81,45 +91,50 @@ def main():
             print('\nEpoch %d/%d\n' % (epoch + 1, args.nepochs))
 
             # train for a single epoch
-            loss_train = trainer.train(epoch, loaders, checkpoints, acc_best)
-            #### fuse kernels ####
-            if epoch == args.fuse_epoch:
-                state_dict = model.state_dict()
-                keys = list(state_dict)
-                keys_mask = [x for x in keys if x.endswith('kernel_mask')]
-                adv_keys = [x for x in keys_mask if state_dict[x].size(0) > 1]
-                # temp_keys = [x for x in adv_keys if torch.sum(state_dict[x][1,:,:,:]-state_dict[x][2,:,:,:]) > 0]
-                # print(len(temp_keys))
-                for key_mask in adv_keys:
-                    kernels = state_dict[key_mask]
-                    dist = 0
-                    for demog_comb in demog_combs:
-                        k1 = kernels[demog_comb[0],:,:,:].view(1,-1)
-                        k2 = kernels[demog_comb[1],:,:,:].view(1,-1)
-                        k1 = k1/torch.norm(k1,dim=1)
-                        k2 = k2/torch.norm(k2,dim=1)
-                        dist += -1*torch.matmul(k1, torch.transpose(k2,0,1))
-                    dist = dist/float(len(demog_combs))
-                    if dist <= args.gac_threshold:
-                        kernels = torch.mean(kernels, dim=0).unsqueeze(0)
-                        kernels = kernels.repeat(len(ndemog),1,1,1)
-                        state_dict[key_mask] = kernels
-                model.load_state_dict(state_dict)
-            #### fuse kernels ####
+            loss_train = trainer.train(loaders, epoch)
 
+            acc_test=0
             if float(epoch) % test_freq == 0:
-                acc_test,acc_mean = tester.test(epoch, loaders)
+                acc_test,acc_mean = tester.test(loaders, epoch)
 
             if loss_best > loss_train:
-                model_best = True
                 loss_best = loss_train
                 acc_best = acc_test
-            model_best = True
             if  float(epoch) % test_freq == 0 and args.save_results:
-                stored_models['model'] = model
+                stored_models['model'] = trainer.model
                 stored_models['loss'] = trainer.criterion
                 stored_models['optimizer'] = trainer.optimizer
-                checkpoints.save(acc_test, stored_models, epoch, 'final', model_best)
+                checkpoints.save(acc_test, stored_models, epoch)
+
+            if epoch == args.fuse_epoch:
+                update_kernels(args, trainer.model, demog_combs, ndemog)
+
+    if args.save_results:
+        writer.close()
+
+def update_kernels(args, model, demog_combs, ndemog):
+    state_dict = model.state_dict()
+    keys = list(state_dict)
+    fuse_keys = [x for x in keys if x.endswith('fuse_mark')]
+    adv_keys = [x for x in keys if x.endswith('kernel_mask')]
+    for i,key_mask in enumerate(adv_keys):
+        kernels = state_dict[key_mask]
+        dist = 0
+        for demog_comb in demog_combs:
+            k1 = kernels[demog_comb[0],:,:,:].view(1,-1)
+            k2 = kernels[demog_comb[1],:,:,:].view(1,-1)
+            k1 = k1/torch.norm(k1,dim=1)
+            k2 = k2/torch.norm(k2,dim=1)
+            temp = -1.0*torch.matmul(k1, torch.transpose(k2,0,1))
+            dist += temp
+        dist = dist/float(len(demog_combs))
+        print(dist)
+        if dist <= args.gac_threshold:
+            state_dict[fuse_keys[i]][0] = -1
+            kernels = torch.mean(kernels, dim=0).unsqueeze(0)
+            kernels = kernels.repeat(len(ndemog),1,1,1)
+            state_dict[key_mask] = kernels
+    model.load_state_dict(state_dict)
 
 if __name__ == "__main__":
     utils.setup_graceful_exit()
@@ -133,3 +148,16 @@ if __name__ == "__main__":
     finally:
         traceback.print_exc(file=sys.stdout)
         utils.cleanup()
+
+
+'''
+GAC:
+Computational complexity:       5963769856.0 5.96G
+Number of parameters:           43580736.0 43.58M
+
+Base:
+Computational complexity:       10.818147328G
+Number of parameters:           74.104128M 43.9998M
+
+MAC - Multiply-Add cumulation
+'''

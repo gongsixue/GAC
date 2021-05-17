@@ -9,75 +9,33 @@ from torch.utils.data.sampler import SubsetRandomSampler
 
 from datasets import *
 
-import pdb
-
 __all__ = ['Dataloader']
 
 class Dataloader:
     def __init__(self, args):
         self.args = args
 
-        self.resolution = (args.resolution_wide, args.resolution_high)
-        self.input_size = (args.input_wide, args.input_high)
-
-    def setup(self, dataloader_type, dataset_options):
-        if 'transform' in dataset_options.keys():
-            temp = dataset_options['transform']
-            transform = transforms.Compose(
-                self.preprocess(dataset_options['transform']))
-            dataset_options['transform'] = transform
-
+    def setup(self, dataloader_type, dataset_options):        
         if dataloader_type == 'FileListLoader':
             dataset = FileListLoader(**dataset_options)
+        elif dataloader_type == 'FolderListLoader':
+            dataset = FolderListLoader(**dataset_options)
         elif dataloader_type == 'CSVListLoader':
             dataset = CSVListLoader(**dataset_options)
-        elif dataloader_type == 'AgeBinaryLoader':
-            dataset = AgeBinaryLoader(**dataset_options)
         elif dataloader_type == 'ClassSamplesDataLoader':
             dataset = ClassSamplesDataLoader(**dataset_options)
         elif dataloader_type == 'GenderCSVListLoader':
             dataset = GenderCSVListLoader(**dataset_options)
+        elif dataloader_type == 'AgeBinaryLoader':
+            dataset = AgeBinaryLoader(**dataset_options)
         elif dataloader_type == 'H5pyLoader':
-            dataset = H5pyLoader(**dataset_options)
-        elif dataloader_type == 'FolderListLoader':
-            dataset = FolderListLoader(**dataset_options)
+            dataset = H5pyLoader(**dataset_options)        
         elif dataloader_type is None:
             print("No data assigned!")
         else:
             raise(Exception("Unknown Training Dataset"))
 
-        dataset_options['transform'] = temp
-
         return dataset
-
-    def preprocess(self, preprocess):
-        process_list = []
-        keys = [ \
-            'CenterCrop', \
-            'RandomCrop', \
-            'Resize', \
-            'RandomHorizontalFlip', \
-            'RandomVerticalFlip', \
-            'RnadomRotation', \
-            'ToTensor', \
-            'Normalize', \
-        ]
-        for key in keys:
-            if key in preprocess.keys():
-                if key == keys[0] or key == keys[1]:
-                    process_list.append(getattr(transforms, key)(self.input_size))
-                elif key == keys[2]:
-                    process_list.append(getattr(transforms, key)(self.resolution))
-                elif key == keys[3] or key == keys[4]:
-                    process_list.append(getattr(transforms, key)())
-                elif key == keys[5]:
-                    process_list.append(getattr(transforms, key)(preprocess[key]))
-                elif key == keys[6]:
-                    process_list.append(getattr(transforms, key)())
-                else:
-                    process_list.append(transforms.Normalize(preprocess[key][0],
-                        preprocess[key][1]))
-        return process_list
 
     def create(self, dataset=None, flag=None):
         dataloader = {}

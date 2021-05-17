@@ -17,11 +17,13 @@ import losses
 import pdb
 
 class Trainer:
-    def __init__(self, args, model, criterion, evaluation, optimizer=None):
+    def __init__(self, args, model, criterion, evaluation, optimizer, writer):
         self.args = args
         self.model = model
         self.criterion = criterion
         self.evaluation = evaluation
+        self.optimizer = optimizer
+        self.writer = writer
 
         self.nepochs = args.nepochs
 
@@ -31,28 +33,13 @@ class Trainer:
         self.scheduler_method = args.scheduler_method
 
         self.att_loss = losses.AttMatrixCov(args.cuda)
-
-        self.optimizer = getattr(optim, self.optim_method)(
-            model.parameters(), lr=self.lr, **self.optim_options)
+        self.dist_loss = losses.DebiasIntraDist(args.cuda)
+        
         if self.scheduler_method is not None:
             if self.scheduler_method != 'Customer':
                 self.scheduler = getattr(optim.lr_scheduler, self.scheduler_method)(
                     self.optimizer, **args.scheduler_options)
 
-        # for classification
-        self.labels = torch.zeros(args.batch_size).long()
-        self.inputs = torch.zeros(
-            args.batch_size,
-            args.resolution_high,
-            args.resolution_wide
-        )
-
-        if args.cuda:
-            self.labels = self.labels.cuda()
-            self.inputs = self.inputs.cuda()
-
-        self.inputs = Variable(self.inputs)
-        self.labels = Variable(self.labels)
 
         # logging training
         self.log_loss = plugins.Logger(
@@ -60,8 +47,8 @@ class Trainer:
             'TrainLogger.txt',
             args.save_results
         )
-        params_loss = ['LearningRate','idLoss', 'attLoss']
-        self.log_loss.register(params_loss)
+        self.params_loss = ['LearningRate','idLoss', 'attLoss']
+        self.log_loss.register(self.params_loss)
 
         # monitor training
         self.monitor = plugins.Monitor()
@@ -72,25 +59,9 @@ class Trainer:
         }
         self.monitor.register(self.params_monitor)
 
-        # visualize training
-        self.visualizer = plugins.Visualizer(args.port, args.env, 'Train')
-        params_visualizer = {
-            'LearningRate': {'dtype': 'scalar', 'vtype': 'plot', 'win': 'learning_rate',
-                    'layout': {'windows': ['train', 'test'], 'id': 0}},
-            'idLoss': {'dtype': 'scalar', 'vtype': 'plot', 'win': 'id_loss',
-                    'layout': {'windows': ['train', 'test'], 'id': 0}},
-            'attLoss': {'dtype': 'scalar', 'vtype': 'plot', 'win': 'att_loss',
-                    'layout': {'windows': ['train', 'test'], 'id': 0}},
-            'Train_Image': {'dtype': 'image', 'vtype': 'image',
-                            'win': 'train_image'},
-            'Train_Images': {'dtype': 'images', 'vtype': 'images',
-                             'win': 'train_images'},
-        }
-        self.visualizer.register(params_visualizer)
-
         # display training progress
         self.print_formatter = 'Train [%d/%d][%d/%d] '
-        for item in params_loss:
+        for item in self.params_loss:
             self.print_formatter += item + " %.4f "
         # self.print_formatter += "IDLoss %.4f AttLoss %.4f"
 
@@ -139,33 +110,34 @@ class Trainer:
             # Update network
             ############################
 
-            demog_labels = torch.squeeze(attributes, dim=1)
-            demog_labels = demog_labels.long()
-            if self.args.cuda:
-                demog_labels = demog_labels.cuda()
-            demog_labels = Variable(demog_labels)
-
+            attrs = torch.squeeze(attributes, dim=1)
             labels = torch.squeeze(labels, dim=1)
 
-            batch_size = inputs.size(0)
-            self.inputs.data.resize_(inputs.size()).copy_(inputs)
-            self.labels.data.resize_(labels.size()).copy_(labels)
-            # self.labels = self.labels.view(-1)
+            labels = labels.long()
+            attrs = attrs.long()
+            if self.args.cuda:
+                inputs = inputs.cuda()
+                labels = labels.cuda()
+                attrs = attrs.cuda()
 
-            outputs,attc,atts = self.model(self.inputs, demog_labels)
-            idloss = self.criterion(outputs, self.labels)
-            attloss = self.args.att_weight*self.att_loss(attc, atts)
-            loss = idloss + attloss
+            # channel attention
+            # outputs,attc,atts = self.model(inputs, attrs)
+            outputs = self.model(inputs)
+            idloss = self.criterion['idLoss'](outputs, labels)
+            # attloss = self.args.att_weight*self.att_loss(attc, atts)
+            distloss = self.dist_loss(outputs,labels,attrs)
+            loss = idloss + 0.1*distloss
 
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
 
             self.losses['idLoss'] = idloss.item()
-            self.losses['attLoss'] = attloss.item()
+            self.losses['attLoss'] = distloss.item()
             for param_group in self.optimizer.param_groups:
                 self.cur_lr = param_group['lr']
             self.losses['LearningRate'] = self.cur_lr
+
             self.monitor.update(self.losses, batch_size)
 
             # print batch progress
@@ -175,21 +147,17 @@ class Trainer:
                 # + [idloss.item(), attloss.item()]
                 ))
 
+            # update tensor board
+            if i%1000 == 0:
+                loss = self.monitor.getvalues()
+                for key in self.params_loss:          
+                    self.writer.add_scalar(key, loss[key], len(dataloader)*epoch+i)
+
         # update the log file
         loss = self.monitor.getvalues()
-        test_freq = 4171
+        test_freq = 45
         if float(epoch) % test_freq == 0:
             self.log_loss.update(loss)
-
-        # print epoch progress
-        # print(self.print_formatter % tuple(
-        #     [epoch + 1, self.nepochs, i+1, len(dataloader)] +
-        #     [loss[key] for key in self.params_monitor]))
-
-        # update the visualization
-        loss['Train_Image'] = inputs[0]
-        loss['Train_Images'] = inputs
-        self.visualizer.update(loss)
 
         # update the learning rate
         if self.scheduler_method is not None:

@@ -13,17 +13,11 @@ import pdb
 class FaceVerification:
     def __init__(self, label_filename,
         protocol='BLUFR', metric='cosine',
-        nthreads=8,multiprocess=True,
-        pair_index_filename=None,template_filename=None,
         pairs_filename=None,nfolds=10,
-        nimgs=None, ndim=None):
+        ):
 
         self.protocol = protocol
         self.metric = metric
-        self.nthreads = nthreads
-        self.multiprocess = multiprocess
-        self.pair_index_filename = pair_index_filename
-        self.template_filename = template_filename
         self.nfolds = nfolds
 
         if label_filename.endswith('npy'):
@@ -39,34 +33,35 @@ class FaceVerification:
             index_dict = get_index_dict(label_filename)
             self.issame_label,self.pair_indices = get_pair_and_label(pairfiles, index_dict)
 
+        if self.protocol == 'RFW_one_race':
+            assert(pairs_filename is not None)
+            key = list(pairs_filename)[0]
+            pairfiles = read_pairfile(pairs_filename[key], self.protocol)
+            index_dict = get_index_dict_rfw(label_filename)
+            self.issame_label,self.pair_indices = get_pair_and_label_rfw(pairfiles, index_dict, key)
+
         if self.protocol == 'RFW':
             assert(pairs_filename is not None)
             index_dict = get_index_dict_rfw(label_filename)
             self.issame_label = {}
             self.pair_indices = {}
             keys = list(pairs_filename)
-            race_dict = {'af': 'Asian', 'am': 'Asian', 'bf': 'African', 'bm': 'African',\
+            race_gender_dict = {'af': 'Asian', 'am': 'Asian', 'bf': 'African', 'bm': 'African',\
                 'cf': 'Caucasian', 'cm': 'Caucasian', 'if': 'Indian', 'im': 'Indian'}
             for key in keys:
                 pair_file = pairs_filename[key]
                 pairfiles = read_pairfile(pair_file, self.protocol)
-                issame, pair_indices = get_pair_and_label_rfw(pairfiles, index_dict, race_dict[key])
+                issame, pair_indices = get_pair_and_label_rfw(pairfiles, index_dict, key)
                 self.issame_label[key] = issame
                 self.pair_indices[key] = pair_indices
 
     def __call__(self, feat):
-        # print('Face Verification on {}'.format(self.protocol))
-        
         if self.metric == 'cosine':
             feat = normalize(feat)
 
         if self.protocol == 'BLUFR':
-            feat_ori = np.load('/scratch/gongsixue/face_resolution/feats/feat_cfp_112x112.npz')
-            feat_ori = feat_ori['feat']
-            feat_ori = normalize(feat_ori)
-
             if self.metric == 'cosine':
-                score_mat = np.dot(feat_ori,feat.T)
+                score_mat = np.dot(feat,feat.T)
             elif self.metric == 'Euclidean':
                 score_mat = np.zeros((feat.shape[0],feat.shape[0]))
                 for i in range(feat.shape[0]):
@@ -79,7 +74,7 @@ class FaceVerification:
             score_vec,label_vec = get_pairwise_score_label(score_mat,self.label)
             TARs,FARs,thresholds = ROC(score_vec,label_vec)
 
-        elif self.protocol == 'LFW':
+        elif self.protocol == 'LFW' or self.protocol == 'RFW_one_race':
             feat1 = feat[self.pair_indices[:,0]]
             feat2 = feat[self.pair_indices[:,1]]
             if self.metric == 'cosine':
@@ -103,9 +98,9 @@ class FaceVerification:
                 acc,thd = accuracy(score_vec, self.issame_label[key])
                 print("Accuracy of {} is {}".format(key, acc))
                 acc_dict[key] = acc
+            avg = np.mean([100.0*acc_dict[x] for x in keys])
             std = np.std([100.0*acc_dict[x] for x in keys])
-            mean = np.mean([100.0*acc_dict[x] for x in keys])
-            return std, mean, acc_dict
+            return avg, std, acc_dict
 
         elif self.protocol == 'CFP':
             feat_ori = np.load('/scratch/gongsixue/face_resolution/feats/feat_cfp_112x112.npz')
@@ -143,98 +138,6 @@ class FaceVerification:
             std = np.std(accs)
             print("Accuracy is {}, STD is {}".format(avg,std))
             return avg,std
-
-        elif self.protocol == 'IJBA':
-            assert(self.pair_index_filename is not None)
-            assert(type(self.pair_index_filename) == str)
-            TARs = []
-            FARs = []
-            thresholds = []
-            for i in range(10):
-                sidx = str(i+1)
-                print('split:[{}\{}]'.format(i+1,10))
-                splitfolder = os.path.join(self.pair_index_filename,'split'+sidx)
-
-                with open(os.path.join(splitfolder,'gen_pairs.csv'), 'r') as f:
-                    gen_pairs = f.readlines()
-                    gen_pairs = [x.split('\n')[0] for x in gen_pairs]
-                with open(os.path.join(splitfolder,'imp_pairs.csv'), 'r') as f:
-                    imp_pairs = f.readlines()
-                    imp_pairs = [x.split('\n')[0] for x in imp_pairs]
-                with open(os.path.join(splitfolder,'temp_dict.pkl'), 'rb') as fp:
-                    template = pickle.load(fp)
-                pairs = [(0,x) for x in imp_pairs]
-                pairs.extend([(1,x) for x in gen_pairs])
-
-                if self.multiprocess:
-                    begin = time.time()
-                    pool = multiprocessing.Pool(self.nthreads)
-                    score_parfunc = partial(score_per_pair, self.metric, feat, template)
-                    results = pool.map(score_parfunc, pairs)
-                    pool.close()
-                    pool.join()
-                    label_vec = [x[0] for x in results if x is not None]        
-                    score_vec = [x[1] for x in results if x is not None]
-                    print('Time of multiple threads is {}'.format(time.time()-begin))
-                else:
-                    label_vec = []
-                    score_vec = []
-                    begin = time.time()
-                    for i,pair in enumerate(pairs):
-                        r = score_per_pair(self.metric,feat,template,pair)
-                        if r is not None:
-                            label_vec.append(r[0])
-                            score_vec.append(r[1])
-                    print('Time of Single thread is {}'.format(time.time()-begin))
-                label_vec = np.array(label_vec).astype(bool)
-                score_vec = np.array(score_vec).reshape(-1)
-                TAR,FAR,threshold = ROC(score_vec,label_vec)
-                TARs.append(TAR)
-                FARs.append(FAR)
-                thresholds.append(threshold)
-            TARs = np.mean(np.array(TARs), axis=0).reshape(-1)
-            FARs = np.mean(np.array(FARs), axis=0).reshape(-1)
-            thresholds = np.mean(np.array(thresholds), axis=0).reshape(-1)
-
-        elif self.protocol == 'IJBB':
-            assert(type(self.pair_index_filename) == dict)
-            assert(self.template_filename is not None)
-            with open(self.pair_index_filename['genuine'], 'r') as f:
-                gen_pairs = f.readlines()
-                gen_pairs = [x.split('\n')[0] for x in gen_pairs]
-            size = len(gen_pairs)
-            with open(self.pair_index_filename['imposter'], 'r') as f:
-                imp_pairs = f.readlines()
-                imp_pairs = [x.split('\n')[0] for x in imp_pairs[:15*size]]
-            with open(self.template_filename, 'rb') as fp:
-                template = pickle.load(fp)
-            pairs = [(0,x) for x in imp_pairs]
-            pairs.extend([(1,x) for x in gen_pairs])
-    
-            if self.multiprocess:
-                begin = time.time()
-                pool = multiprocessing.Pool(self.nthreads)
-                score_parfunc = partial(score_per_pair, self.metric, feat, template)
-                results = pool.map(score_parfunc, pairs)
-                pool.close()
-                pool.join()
-                label_vec = [x[0] for x in results if x is not None]        
-                score_vec = [x[1] for x in results if x is not None]
-                print('Time of multiple threads is {}'.format(time.time()-begin))
-            else:
-                label_vec = []
-                score_vec = []
-                begin = time.time()
-                for i,pair in enumerate(pairs):
-                    r = score_per_pair(self.metric,feat,template,pair)
-                    if r is not None:
-                        label_vec.append(r[0])
-                        score_vec.append(r[1])
-                print('Time of Single thread is {}'.format(time.time()-begin))
-            label_vec = np.array(label_vec).astype(bool)
-            score_vec = np.array(score_vec).reshape(-1)
-            TARs,FARs,thresholds = ROC(score_vec,label_vec)
-
         else:
             raise(RuntimeError('Protocol doest not support!'))
         

@@ -5,8 +5,6 @@ import math
 import pickle
 from eval_utils import *
 
-import pdb
-
 # Compare between every row of x1 and every row of x2
 def cosineSimilarity(x1,x2):
     assert x1.shape[1]==x2.shape[1]

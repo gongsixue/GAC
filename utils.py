@@ -12,7 +12,7 @@ import psutil
 import signal
 import shutil
 
-import plotly
+# import plotly
 import json
 
 
@@ -145,12 +145,12 @@ def gaussian(size, center, sigma=1):
     return np.exp(-(num / den)) / math.sqrt(2 * np.pi * sigma * sigma)
 
 
-def plotlify(fig, env='main', win='mywin'):
-    fig = {key: fig[key] for key in fig.keys()}
-    fig['win'] = win
-    fig['eid'] = env
+# def plotlify(fig, env='main', win='mywin'):
+#     fig = {key: fig[key] for key in fig.keys()}
+#     fig['win'] = win
+#     fig['eid'] = env
 
-    return json.loads(json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder))
+#     return json.loads(json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder))
 
 def normalize(x, tool, axis=None, epsilon=10e-12):
     ''' Devide the vectors in x by their norms.'''

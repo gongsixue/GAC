@@ -1,5 +1,4 @@
-torch>=0.3.1
+torch>=1.6.0
 plotly>=2.2.3
-visdom>=0.1.7
 psutil>=5.4.1
 scikit-image>=0.13.1

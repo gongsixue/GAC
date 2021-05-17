@@ -13,13 +13,13 @@ import torch.nn.functional as F
 import pdb
 
 
-__all__ = ['gac_face18', 'gac_face34', 'gac_face50', 'gac_face100', 'gac_face152']
+__all__ = ['gac_pseudo50']
 
 
 def conv3x3(ndemog, in_planes, out_planes, stride=1, adap=False, fuse_epoch=9):
     """3x3 convolution with padding"""
     return AdaConv2d(ndemog, in_planes, out_planes, 3, stride,
-                     padding=1, bias=False, adap=adap, fuse_epoch=fuse_epoch)
+                     padding=1, adap=adap, fuse_epoch=fuse_epoch)
     # return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
     #                  padding=1, bias=False)
 
@@ -32,10 +32,10 @@ class IRBlock(nn.Module):
         adap=False, fuse_epoch=9):
         super(IRBlock, self).__init__()
         self.bn0 = nn.BatchNorm2d(inplanes)
-        self.conv1 = conv3x3(ndemog, inplanes, planes, adap=adap, fuse_epoch=fuse_epoch)
+        self.conv1 = conv3x3(ndemog, inplanes, planes, stride, adap=adap, fuse_epoch=fuse_epoch)
         self.bn1 = nn.BatchNorm2d(planes)
         self.prelu1 = nn.PReLU(num_parameters=planes)
-        self.conv2 = conv3x3(ndemog, planes, planes, stride, adap=adap, fuse_epoch=fuse_epoch)
+        self.conv2 = conv3x3(ndemog, planes, planes, adap=adap, fuse_epoch=fuse_epoch)
         self.bn2 = nn.BatchNorm2d(planes)
         self.prelu2 = nn.PReLU(num_parameters=planes)
         self.downsample = downsample
@@ -48,12 +48,12 @@ class IRBlock(nn.Module):
             self.att = AttBlock(planes, height, width, ndemog, use_spatial_att,
                 hard_att_channel, hard_att_spatial, lowresol_set)
 
-    def forward(self, x_dict):
-        x = x_dict['x']
-        demog_label = x_dict['demog_label']
-        epoch = x_dict['epoch']
+    def forward(self, x):
+        epoch = 0
         attc = None
         atts = None
+
+        demog_label = torch.ones(x.size(0)).long()
 
         residual = x
         out = self.bn0(x)
@@ -75,24 +75,7 @@ class IRBlock(nn.Module):
         if self.use_att:
             out,attc,atts = self.att(out, demog_label)
 
-        return {'x':out, 'demog_label':demog_label, 'epoch': epoch, 'attc':attc, 'atts':atts}
-
-class SEBlock(nn.Module):
-    def __init__(self, channel, reduction=16):
-        super(SEBlock, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-                nn.Linear(channel, channel // reduction),
-                nn.PReLU(),
-                nn.Linear(channel // reduction, channel),
-                nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y
+        return out
 
 class AttBlock(nn.Module): # add more options, e.g, hard attention, low resolution attention
     def __init__(self, nchannel, height, width, ndemog=4, use_spatial_att=False,
@@ -122,7 +105,7 @@ class AttBlock(nn.Module): # add more options, e.g, hard attention, low resoluti
     def forward(self, x, demog_label):
         y = x
         demogs = list(set(demog_label.tolist()))
-        
+
         if self.hard_att_channel:
             att_channel = torch.where(torch.sigmoid(self.att_channel) >= 0.5, 
                 torch.ones_like(self.att_channel), torch.zeros_like(self.att_channel))
@@ -142,7 +125,7 @@ class AttBlock(nn.Module): # add more options, e.g, hard attention, low resoluti
 
         if self.use_spatial_att:
             for demog in demogs:
-                indices = (demog_label==demog).nonzero().squeeze()
+                indices = torch.nonzero((demog_label==demog), as_tuple=False).squeeze()
                 if indices.dim() == 0:
                     indices = indices.unsqueeze(0)
                 y[indices,:,:,:] = x[indices,:,:,:] *\
@@ -150,7 +133,7 @@ class AttBlock(nn.Module): # add more options, e.g, hard attention, low resoluti
                     att_spatial.repeat(1, indices.size(0), x.size(1), 1, 1)[demog,:,:,:,:]
         else:
             for demog in demogs:
-                indices = (demog_label==demog).nonzero().squeeze()
+                indices = torch.nonzero((demog_label==demog), as_tuple=False).squeeze()
                 if indices.dim() == 0:
                     indices = indices.unsqueeze(0)
                 y[indices,:,:,:] = x[indices,:,:,:] *\
@@ -158,7 +141,7 @@ class AttBlock(nn.Module): # add more options, e.g, hard attention, low resoluti
         return y, att_channel, att_spatial
 
 class AdaConv2d(nn.Module):
-    def __init__(self, ndemog, ic, oc, ks, stride, padding=0, bias=True, adap=True, fuse_epoch=9):
+    def __init__(self, ndemog, ic, oc, ks, stride, padding=0, adap=True, fuse_epoch=9):
         super(AdaConv2d, self).__init__()
         self.stride = stride
         self.padding = padding
@@ -168,6 +151,12 @@ class AdaConv2d(nn.Module):
         self.adap = adap
         self.kernel_base = nn.Parameter(torch.Tensor(oc, ic, ks, ks))
         self.kernel_mask = nn.Parameter(torch.Tensor(1, ic, ks, ks))
+        self.fuse_mark = nn.Parameter(torch.zeros(1))
+
+        self.conv1 = nn.Conv2d(ic, oc, kernel_size=ks, stride=stride, padding=padding, bias=False)
+        self.conv2 = nn.Conv2d(ic, oc, kernel_size=ks, stride=stride, padding=padding, bias=False)
+        self.conv3 = nn.Conv2d(ic, oc, kernel_size=ks, stride=stride, padding=padding, bias=False)
+        self.conv4 = nn.Conv2d(ic, oc, kernel_size=ks, stride=stride, padding=padding, bias=False)
 
         if adap:
             self.kernel_mask.data = self.kernel_mask.data.repeat(ndemog,1,1,1)
@@ -175,25 +164,39 @@ class AdaConv2d(nn.Module):
     def forward(self, x, demog_label, epoch):
         demogs = list(set(demog_label.tolist()))
 
-        if self.adap:
-            y = []
-            for demog in demogs:
-                indices = (demog_label==demog).nonzero().squeeze()
-                if indices.dim() == 0:
-                    indices = indices.unsqueeze(0)
-                if epoch > self.fuse_epoch:
-                    if torch.equal(self.kernel_mask[1,:,:,:],self.kernel_mask[2,:,:,:]):
-                        mask = self.kernel_mask[0,:,:,:].unsqueeze(0)
-                    else:
-                        mask = self.kernel_mask[demog,:,:,:].unsqueeze(0)
+        for i,demog in enumerate(demogs):
+            # get indices
+            indices = torch.nonzero((demog_label==demog), as_tuple=False).squeeze()
+            if indices.dim() == 0:
+                indices = indices.unsqueeze(0)
+            
+            # get mask
+            if epoch >= self.fuse_epoch:
+                if self.fuse_mark[0] == -1:
+                    mask = self.kernel_mask[0,:,:,:].unsqueeze(0)
                 else:
                     mask = self.kernel_mask[demog,:,:,:].unsqueeze(0)
-                y.append(F.conv2d(x[indices,:,:,:], self.kernel_base*mask.repeat(self.oc,1,1,1),
-                    stride=self.stride, padding=self.padding))
-            output = torch.cat(y,0)
+            else:
+                mask = self.kernel_mask[demog,:,:,:].unsqueeze(0)
 
-        else:
-            output = F.conv2d(x, self.kernel_base, stride=self.stride, padding=self.padding)
+            # get output
+            if i == 0:
+                temp = self.conv1(x[indices,:,:,:])
+                size = [x.size(0)]
+                for i in range(1,temp.dim()):
+                    size.append(temp.size(i))
+                output = torch.zeros(size)
+                if x.is_cuda:
+                    output = output.cuda()
+            if demog == 0:
+                output[indices,:,:,:] = self.conv1(x[indices,:,:,:])
+            elif demog == 1:
+                output[indices,:,:,:] = self.conv2(x[indices,:,:,:])
+            elif demog == 2:
+                output[indices,:,:,:] = self.conv3(x[indices,:,:,:])
+            else:
+                output[indices,:,:,:] = self.conv4(x[indices,:,:,:])
+                
 
         return output
 
@@ -285,7 +288,9 @@ class ResNetFace(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x, demog_label, epoch):
+    def forward(self, x):#, epoch):
+        demog_label = torch.ones(x.size(0)).long()
+
         x,attc1,atts1 = self.attinput(x,demog_label)
         
         x = self.conv1(x) # 3 x 112 x 112
@@ -294,50 +299,40 @@ class ResNetFace(nn.Module):
         x = self.maxpool(x) # 64 x 56 x 56
         x,attc2,atts2 = self.attconv1(x,demog_label)
 
-        x_dict = self.layer1({'x':x, 'demog_label':demog_label, 'epoch':epoch}) # 64 x 56 x 56
-        attc3 = x_dict['attc']
-        atts3 = x_dict['atts']
+        x = self.layer1(x)#, 'epoch':epoch}) # 64 x 56 x 56
 
-        x_dict = self.layer2(x_dict) # 128 x 28 x 28
-        attc4 = x_dict['attc']
-        atts4 = x_dict['atts']
+        x = self.layer2(x) # 128 x 28 x 28
 
-        x_dict = self.layer3(x_dict) # 256 x 14 x 14
-        attc5 = x_dict['attc']
-        atts5 = x_dict['atts']
+        x = self.layer3(x) # 256 x 14 x 14
 
-        x_dict = self.layer4(x_dict) # 512 x 7 x 7
+        x = self.layer4(x) # 512 x 7 x 7
 
-        x = x_dict['x']
         x = self.bn4(x)
-        x,attc6,atts6 = self.attbn4(x, demog_label)
+        x6 = self.attbn4(x, demog_label)
 
         x = self.dropout(x)
         x = x.view(x.size(0), -1) # 1 x 25088
         x = self.fc5(x) # 1 x 512
         x = self.bn5(x)
 
-        attc = [attc1, attc2, attc3, attc4, attc5, attc6]
-        atts = [atts1, atts2, atts3, atts4, atts5, atts6]
+        return x
 
-        return x,attc,atts
-
-def gac_face18(use_se=False, **kwargs):
+def gac_pseudo18(use_se=False, **kwargs):
     model = ResNetFace(IRBlock, [2, 2, 2, 2], use_se=use_se, **kwargs)
     return model
 
-def gac_face34(use_se=False, **kwargs):
+def gac_pseudo34(use_se=False, **kwargs):
     model = ResNetFace(IRBlock, [3, 4, 6, 3], use_se=use_se, **kwargs)
     return model
 
-def gac_face50(use_se=False, **kwargs):
+def gac_pseudo50(use_se=False, **kwargs):
     model = ResNetFace(IRBlock, [3, 4, 14, 3], use_se=use_se, **kwargs)
     return model
 
-def gac_face100(use_se=False, **kwargs):
+def gac_pseudo100(use_se=False, **kwargs):
     model = ResNetFace(IRBlock, [3, 13, 30, 3], use_se=use_se, **kwargs)
     return model
 
-def gac_face152(use_se=False, **kwargs):
+def gac_pseudo152(use_se=False, **kwargs):
     model = ResNetFace(IRBlock, [3, 8, 36, 3], use_se=use_se, **kwargs)
     return model

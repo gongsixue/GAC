@@ -165,6 +165,40 @@ def make_dataset_gac_csvlist(ifile, ind_attr):
 
     return idclassname, data_dict
 
+def make_dataset_csvlist(ifile, ind_attr):
+    datalist = []
+    classname = []
+
+    if ifile is not None:
+        with open(ifile, 'r') as csvfile:
+            reader = csv.reader(csvfile, delimiter='\t')
+            for i,row in enumerate(reader):
+                if 'NaN' in row:
+                    idx = [x[0] for x in enumerate(row) if x[1] == 'NaN']
+                    for j in idx:
+                        row[j] = -1
+                path = row[0]
+                datalist.append(row)
+                ############## Age!!!! ##############
+                classname.append(int(row[1])) # age!
+                ############## Age!!!! ##############
+
+    label_dict = {}
+    classname = list(set(classname))
+    for i,item in enumerate(classname):
+        label_dict[item] = i
+
+    data_dict = {}
+    for i in range(len(datalist)):
+        name = int(datalist[i][1])
+        idx = label_dict[name]
+        if idx not in data_dict:
+            data_dict[idx] = [datalist[i]]
+        else:
+            data_dict[idx].append(datalist[i])
+
+    return label_dict, data_dict
+
 class Iterator(object):
 
     def __init__(self, imagelist):
@@ -192,10 +226,7 @@ class ClassSamplesDataLoader(data.Dataset):
         self.root = root
         self.num_images = num_images
         self.ind_attr = ind_attr
-        label_list, datalist = make_dataset_gac_csvlist(ifile, ind_attr)
-
-        self.dict_attr = {'0':0, '1':1, '2': 2, '3':3, '00':0, '01':1, '02':2, '03':3,\
-            '10':4, '11':5, '12':6, '13':7}
+        label_list, datalist = make_dataset_csvlist(ifile, ind_attr)
 
         if len(datalist) == 0:
             raise(RuntimeError("No images found"))
@@ -209,7 +240,7 @@ class ClassSamplesDataLoader(data.Dataset):
             self.datalist = datalist
 
         self.num_classes = len(list(self.datalist))
-        self.class_iter = {}
+        self.class_iter = {} 
         for i in range(self.num_classes):
             self.class_iter[i] = Iterator(self.datalist[i])
 
@@ -229,13 +260,9 @@ class ClassSamplesDataLoader(data.Dataset):
             images.append(self.transform(image))
             fmetas.append(self.datalist[index][ind][0])
             
-            category = ''
-            for j in self.ind_attr:
-                category += self.datalist[index][ind][j]
-            demog_label = int(self.dict_attr[category])
-            attributes.append(torch.Tensor([demog_label]))
+            attributes.append(torch.Tensor([int(self.datalist[index][ind][2])]))
             
-            label = self.classes.index(self.datalist[index][ind][1])
+            label = self.classes[int(self.datalist[index][ind][1])]
             labels.append(torch.Tensor([label]))
         
         images = torch.stack(images)

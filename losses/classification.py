@@ -9,12 +9,10 @@ import torch
 from torch.autograd import Variable
 import pdb
 
-__all__ = ['Classification', 'BinaryClassify', 'CrossEntropy', \
-'AM_Softmax_arcface', 'AM_Softmax_marginatt' \
+__all__ = ['Classification', 'BinaryClassify', 'Softmax', 'CrossEntropy', 'AM_Softmax_marginatt', \
+    'SphereFace', 'CosFace', 'ArcFace', \
     ]
 
-
-# REVIEW: does this have to inherit nn.Module?
 class Classification(nn.Module):
     def __init__(self, if_cuda=False):
         super(Classification, self).__init__()
@@ -114,43 +112,6 @@ class AM_Softmax_old(nn.Module):
         
         return loss, scale_
 
-class AM_Softmax_arcface(nn.Module):
-    """Implement of large margin cosine distance: :
-    Args:
-        in_features: size of each input sample
-        out_features: size of each output sample
-        s: norm of input feature
-        m: margin
-    """
-
-    def __init__(self, nfeatures, nclasses, s=64.0, m=0.35):
-        super(AM_Softmax_arcface, self).__init__()
-        self.s = s
-        self.m = m
-        self.weights = nn.parameter.Parameter(torch.Tensor(nclasses, nfeatures))
-        nn.init.xavier_uniform_(self.weights)
-        #stdv = 1. / math.sqrt(self.weight.size(1))
-        #self.weight.data.uniform_(-stdv, stdv)
-
-        self.loss = nn.CrossEntropyLoss()
-
-    def forward(self, input, label):
-        label = label.long()
-        input = F.normalize(input,p=2,dim=1)
-        weights = F.normalize(self.weights,p=2,dim=1)
-        cosine = torch.mm(input, weights.t())
-        # cosine = F.linear(F.normalize(input), F.normalize(self.weight))
-        # --------------------------- convert label to one-hot ---------------------------
-        # https://discuss.pytorch.org/t/convert-int-into-one-hot-format/507
-        one_hot = torch.zeros_like(cosine)
-        one_hot.scatter_(1, label.view(-1, 1), 1.0)
-        # -------------torch.where(out_i = {x_i if condition_i else y_i) -------------
-        output = self.s * (cosine - one_hot * self.m)
-
-        loss = self.loss(output, label)
-
-        return loss
-
 class AM_Softmax_marginatt(nn.Module): 
     """Implement of large margin cosine distance: :
     Args:
@@ -198,3 +159,137 @@ class AM_Softmax_marginatt(nn.Module):
         loss += regularizer
 
         return loss, temp
+
+class SphereFace(nn.Module):
+    def __init__(self, gamma=0, if_cuda=False):
+        super(AngleLoss, self).__init__()
+        self.gamma = gamma
+        self.it = 0
+        self.LambdaMin = 5.0
+        self.LambdaMax = 1500.0
+        self.lamb = 1500.0
+        self.if_cuda = if_cuda
+
+    def forward(self, input, target):
+        self.it += 1
+        cos_theta, phi_theta = input
+        target = target.view(-1, 1)  # size=(B,1)
+
+        index = cos_theta.data * 0.0  # size=(B,Classnum)
+        index.scatter_(1, target.data.view(-1, 1), 1)
+        index = index.byte()
+        if self.if_cuda:
+            index = index.cuda()
+        index = Variable(index)
+
+        self.lamb = max(self.LambdaMin, self.LambdaMax / (1 + 0.1 * self.it))
+        output = cos_theta * 1.0  # size=(B,Classnum)
+        output[index] -= cos_theta[index] * (1.0 + 0) / (1 + self.lamb)
+        output[index] += phi_theta[index] * (1.0 + 0) / (1 + self.lamb)
+
+        logpt = F.log_softmax(output, dim=1)
+        logpt = logpt.gather(1, target)
+        logpt = logpt.view(-1)
+        pt = Variable(logpt.data.exp())
+
+        loss = -1 * (1 - pt)**self.gamma * logpt
+        loss = loss.mean()
+
+        return loss
+
+class CosFace(nn.Module):
+    """Implement of large margin cosine distance: :
+    Args:
+        in_features: size of each input sample
+        out_features: size of each output sample
+        s: norm of input feature
+        m: margin
+    """
+
+    def __init__(self, nfeatures, nclasses, s=64.0, m=0.35):
+        super(AM_Softmax_arcface, self).__init__()
+        self.s = s
+        self.m = m
+        self.weights = nn.parameter.Parameter(torch.Tensor(nclasses, nfeatures))
+        nn.init.xavier_uniform_(self.weights)
+        #stdv = 1. / math.sqrt(self.weight.size(1))
+        #self.weight.data.uniform_(-stdv, stdv)
+
+        self.loss = nn.CrossEntropyLoss()
+
+    def forward(self, input, label):
+        label = label.long()
+        input = F.normalize(input,p=2,dim=1)
+        weights = F.normalize(self.weights,p=2,dim=1)
+        cosine = torch.mm(input, weights.t())
+        # cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+        # --------------------------- convert label to one-hot ---------------------------
+        # https://discuss.pytorch.org/t/convert-int-into-one-hot-format/507
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, label.view(-1, 1), 1.0)
+        # -------------torch.where(out_i = {x_i if condition_i else y_i) -------------
+        output = self.s * (cosine - one_hot * self.m)
+
+        loss = self.loss(output, label)
+
+        return loss
+
+def l2_norm(input, axis = 1):
+    norm = torch.norm(input, 2, axis, True)
+    output = torch.div(input, norm)
+
+    return output
+
+class ArcFace(nn.Module):
+    r"""Implement of ArcFace (https://arxiv.org/pdf/1801.07698v1.pdf):
+        Args:
+            in_features: size of each input sample
+            out_features: size of each output sample
+            device_id: the ID of GPU where the model will be trained by model parallel. 
+                       if device_id=None, it will be trained on CPU without model parallel.
+            s: norm of input feature
+            m: margin
+            cos(theta+m)
+        """
+    def __init__(self, in_features, out_features, s = 64.0, m = 0.50, easy_margin = False):
+        super(ArcFace, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.s = s
+        self.m = m
+        
+        self.kernel = nn.parameter.Parameter(torch.FloatTensor(in_features, out_features))
+        #nn.init.xavier_uniform_(self.kernel)
+        nn.init.normal_(self.kernel, std=0.01)
+
+        self.easy_margin = easy_margin
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+
+        self.loss = nn.CrossEntropyLoss()
+
+    def forward(self, embbedings, label):
+        embbedings = l2_norm(embbedings, axis = 1)
+        kernel_norm = l2_norm(self.kernel, axis = 0)
+        cos_theta = torch.mm(embbedings, kernel_norm)
+        cos_theta = cos_theta.clamp(-1, 1)  # for numerical stability
+        with torch.no_grad():
+            origin_cos = cos_theta.clone()
+        target_logit = cos_theta[torch.arange(0, embbedings.size(0)), label].view(-1, 1)
+
+        sin_theta = torch.sqrt(1.0 - torch.pow(target_logit, 2))
+        cos_theta_m = target_logit * self.cos_m - sin_theta * self.sin_m #cos(target+margin)
+        if self.easy_margin:
+            final_target_logit = torch.where(target_logit > 0, cos_theta_m, target_loit)
+        else:
+            final_target_logit = torch.where(target_logit > self.th, cos_theta_m, target_logit - self.mm)
+
+        cos_theta.scatter_(1, label.view(-1, 1).long(), final_target_logit)
+        
+        output = cos_theta * self.s
+        original_logits = origin_cos * self.s
+        loss = self.loss(output, label)
+        return loss
