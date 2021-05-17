@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch
 import pdb
 
-__all__ = ['IR_50', 'IR_101', 'IR_152', 'IR_SE_50', 'IR_SE_101', 'IR_SE_152']
+__all__ = ['gac_IR_SE_50', 'gac_IR_SE_101', 'gac_IR_SE_152']
 
 ##################################  Original Arcface Model #############################################################
 
@@ -42,15 +42,15 @@ class SEModule(Module):
 
 class AttBlock(nn.Module): # add more options, e.g, hard attention, low resolution attention
     def __init__(self, nchannel, height, width, ndemog=4, use_spatial_att=False,
-        hard_att_channel=False, hard_att_spatial=False, lowersol_set={}):
+        hard_att_channel=False, hard_att_spatial=False, lowresol_set={}):
         super(AttBlock, self).__init__()
         self.ndemog = ndemog
 
         self.hard_att_channel = hard_att_channel
         self.hard_att_spatial = hard_att_spatial
         
-        self.lowersol_mode = lowersol_set['mode']
-        lowersol_rate = lowersol_set['rate']
+        self.lowersol_mode = lowresol_set['mode']
+        lowersol_rate = lowresol_set['rate']
 
         self.att_channel = nn.parameter.Parameter(torch.Tensor(1, 1, nchannel, 1, 1))
         nn.init.xavier_uniform_(self.att_channel)
@@ -214,7 +214,8 @@ class bottleneck_IR(Module):
         return res + shortcut
 
 class bottleneck_IR_SE(Module):
-    def __init__(self, in_channel, depth, stride):
+    def __init__(self, in_channel, depth, stride, ndemog, adap, fuse_epoch,
+        use_att, height, width, use_spatial_att, hard_att_channel, hard_att_spatial, lowresol_set):
         super(bottleneck_IR_SE, self).__init__()
         if in_channel == depth:
             self.shortcut_layer = MaxPool2d(1, stride)
@@ -222,67 +223,153 @@ class bottleneck_IR_SE(Module):
             self.shortcut_layer = Sequential(
                 Conv2d(in_channel, depth, (1, 1), stride ,bias=False), 
                 BatchNorm2d(depth))
-        self.res_layer = Sequential(
-            BatchNorm2d(in_channel),
-            AdaConv2d(in_channel, depth, (3,3), (1,1),1 ,bias=False),
-            # (self, ndemog, ic, oc, ks, stride, padding=0, adap=True, fuse_epoch=9)
-            PReLU(depth),
-            Conv2d(depth, depth, (3,3), stride, 1 ,bias=False),
-            BatchNorm2d(depth),
-            SEModule(depth,16)
-            )
-    def forward(self,x):
-        shortcut = self.shortcut_layer(x)
-        res = self.res_layer(x)
-        return res + shortcut
+        # self.res_layer = Sequential(
+        #     BatchNorm2d(in_channel),
+        #     AdaConv2d(ndemog, in_channel, depth, 3, 1,1 ,adap, fuse_epoch),
+        #     PReLU(depth),
+        #     AdaConv2d(ndemog, depth, depth, 3, stride, 1 ,adap, fuse_epoch),
+        #     BatchNorm2d(depth),
+        #     SEModule(depth,16)
+        #     )
+        self.bn0 = BatchNorm2d(in_channel)
+        self.conv1 = AdaConv2d(ndemog, in_channel, depth, 3, 1,1 ,adap, fuse_epoch)
+        self.prelu = PReLU(depth)
+        self.conv2 = AdaConv2d(ndemog, depth, depth, 3, stride, 1 ,adap, fuse_epoch)
+        self.bn1 = BatchNorm2d(depth)
+        self.use_se = SEModule(depth,16)
 
-class Bottleneck(namedtuple('Block', ['in_channel', 'depth', 'stride'])):
+        self.use_att = use_att
+        if self.use_att:
+            self.att = AttBlock(depth, height, width, ndemog, use_spatial_att,
+                hard_att_channel, hard_att_spatial, lowresol_set)
+
+    def forward(self,inputs):
+        x = inputs['x']
+        demog_label = inputs['demog_label']
+        epoch = inputs['epoch']
+        shortcut = self.shortcut_layer(x)
+        x = self.bn0(x)
+        x = self.conv1(x, demog_label, epoch)
+        x = self.prelu(x)
+        x = self.conv2(x, demog_label, epoch)
+        x = self.bn1(x)
+        x = self.use_se(x)
+        x = x + shortcut
+
+        attc = None
+        atts = None
+
+        if self.use_att:
+            x,attc,atts = self.att(x, demog_label)
+        return {'x':x, 'demog_label':demog_label, 'epoch':epoch, 'attc':attc, 'atts':atts}
+
+class Bottleneck(namedtuple('Block', ['in_channel', 'depth', 'stride', 
+    'ndemog', 'adap', 'fuse_epoch',
+    'use_att', 'height', 'width', 'use_spatial_att', 'hard_att_channel', 'hard_att_spatial', 'lowresol_set'])):
     '''A named tuple describing a ResNet block.'''
     
-def get_block(in_channel, depth, num_units, stride = 2):
-  return [Bottleneck(in_channel, depth, stride)] + \
-    [Bottleneck(depth, depth, 1) for i in range(num_units-1)]
+def get_block(in_channel, depth, num_units, ndemog, adap, fuse_epoch, 
+    use_att, height, width, use_spatial_att, hard_att_channel, hard_att_spatial, lowresol_set):
+  return [Bottleneck(in_channel, depth, 2, ndemog, adap, fuse_epoch, 
+    use_att, height, width, use_spatial_att, hard_att_channel, hard_att_spatial, lowresol_set)] + \
+    [Bottleneck(depth, depth, 1, ndemog, adap, fuse_epoch,
+        use_att, height, width, use_spatial_att, hard_att_channel, hard_att_spatial, lowresol_set) \
+        for i in range(num_units-1)]
 
-def get_blocks(num_layers):
+def get_blocks(num_layers, ndemog, fuse_epoch, att_dict):
+    use_spatial_att = att_dict['use_spatial_att']
+    hard_att_channel = att_dict['hard_att_channel']
+    hard_att_spatial = att_dict['hard_att_spatial']
+    lowresol_set = att_dict['lowresol_set']
     if num_layers == 50:
         blocks = [
-            get_block(in_channel=64, depth=64, num_units = 3),
-            get_block(in_channel=64, depth=128, num_units=4),
-            get_block(in_channel=128, depth=256, num_units=14),
-            get_block(in_channel=256, depth=512, num_units=3)
+            get_block(in_channel=64, depth=64, num_units = 3, 
+                ndemog=ndemog, adap=True, fuse_epoch=fuse_epoch,
+                use_att=True, height=56, width=56, use_spatial_att=use_spatial_att, 
+                hard_att_channel=hard_att_channel, hard_att_spatial=hard_att_spatial, 
+                lowresol_set=lowresol_set),
+            get_block(in_channel=64, depth=128, num_units=4, 
+                ndemog=ndemog, adap=True, fuse_epoch=fuse_epoch,
+                use_att=True, height=28, width=28, use_spatial_att=use_spatial_att, 
+                hard_att_channel=hard_att_channel, hard_att_spatial=hard_att_spatial, 
+                lowresol_set=lowresol_set),
+            get_block(in_channel=128, depth=256, num_units=14, 
+                ndemog=ndemog, adap=True, fuse_epoch=fuse_epoch,
+                use_att=True, height=14, width=14, use_spatial_att=use_spatial_att, 
+                hard_att_channel=hard_att_channel, hard_att_spatial=hard_att_spatial, 
+                lowresol_set=lowresol_set),
+            get_block(in_channel=256, depth=512, num_units=3, 
+                ndemog=ndemog, adap=True, fuse_epoch=fuse_epoch,
+                use_att=True, height=7, width=7, use_spatial_att=use_spatial_att, 
+                hard_att_channel=hard_att_channel, hard_att_spatial=hard_att_spatial, 
+                lowresol_set=lowresol_set)
         ]
     elif num_layers == 100:
         blocks = [
-            get_block(in_channel=64, depth=64, num_units=3),
-            get_block(in_channel=64, depth=128, num_units=13),
-            get_block(in_channel=128, depth=256, num_units=30),
-            get_block(in_channel=256, depth=512, num_units=3)
+            get_block(in_channel=64, depth=64, num_units=3, 
+                ndemog=ndemog, adap=True, fuse_epoch=fuse_epoch,
+                use_att=True, height=56, width=56, use_spatial_att=use_spatial_att, 
+                hard_att_channel=hard_att_channel, hard_att_spatial=hard_att_spatial, 
+                lowresol_set=lowresol_set),
+            get_block(in_channel=64, depth=128, num_units=13, 
+                ndemog=ndemog, adap=True, fuse_epoch=fuse_epoch,
+                use_att=True, height=28, width=28, use_spatial_att=use_spatial_att, 
+                hard_att_channel=hard_att_channel, hard_att_spatial=hard_att_spatial, 
+                lowresol_set=lowresol_set),
+            get_block(in_channel=128, depth=256, num_units=30, 
+                ndemog=ndemog, adap=True, fuse_epoch=fuse_epoch,
+                use_att=True, height=14, width=14, use_spatial_att=use_spatial_att, 
+                hard_att_channel=hard_att_channel, hard_att_spatial=hard_att_spatial, 
+                lowresol_set=lowresol_set),
+            get_block(in_channel=256, depth=512, num_units=3, 
+                ndemog=ndemog, adap=True, fuse_epoch=fuse_epoch,
+                use_att=True, height=7, width=7, use_spatial_att=use_spatial_att, 
+                hard_att_channel=hard_att_channel, hard_att_spatial=hard_att_spatial, 
+                lowresol_set=lowresol_set)
         ]
     elif num_layers == 152:
         blocks = [
-            get_block(in_channel=64, depth=64, num_units=3),
-            get_block(in_channel=64, depth=128, num_units=8),
-            get_block(in_channel=128, depth=256, num_units=36),
-            get_block(in_channel=256, depth=512, num_units=3)
+            get_block(in_channel=64, depth=64, num_units=3, 
+                ndemog=ndemog, adap=True, fuse_epoch=fuse_epoch,
+                use_att=True, height=56, width=56, use_spatial_att=use_spatial_att, 
+                hard_att_channel=hard_att_channel, hard_att_spatial=hard_att_spatial, 
+                lowresol_set=lowresol_set),
+            get_block(in_channel=64, depth=128, num_units=8, 
+                ndemog=ndemog, adap=True, fuse_epoch=fuse_epoch,
+                use_att=True, height=28, width=28, use_spatial_att=use_spatial_att, 
+                hard_att_channel=hard_att_channel, hard_att_spatial=hard_att_spatial, 
+                lowresol_set=lowresol_set),
+            get_block(in_channel=128, depth=256, num_units=36, 
+                ndemog=ndemog, adap=True, fuse_epoch=fuse_epoch,
+                use_att=True, height=14, width=14, use_spatial_att=use_spatial_att, 
+                hard_att_channel=hard_att_channel, hard_att_spatial=hard_att_spatial, 
+                lowresol_set=lowresol_set),
+            get_block(in_channel=256, depth=512, num_units=3, 
+                ndemog=ndemog, adap=True, fuse_epoch=fuse_epoch,
+                use_att=True, height=7, width=7, use_spatial_att=use_spatial_att, 
+                hard_att_channel=hard_att_channel, hard_att_spatial=hard_att_spatial, 
+                lowresol_set=lowresol_set)
         ]
     return blocks
 
 class Backbone(Module):
-    def __init__(self, input_size, num_layers, mode, **kwargs,):
+    def __init__(self, num_layers, mode, **kwargs):
         super(Backbone, self).__init__()
-        assert input_size[0] in [112, 224], "input_size should be [112, 112] or [224, 224]"
+        # assert input_size[0] in [112, 224], "input_size should be [112, 112] or [224, 224]"
         assert num_layers in [50, 100, 152], "num_layers should be 50, 100 or 152"
         assert mode in ['ir', 'ir_se'], "mode should be ir or ir_se"
 
-        self.use_se = kwargs['use_se']
-        self.use_spatial_att = kwargs['use_spatial_att']
+        # self.use_se = kwargs['use_se']
+        use_spatial_att = kwargs['use_spatial_att']
         self.ndemog = kwargs['ndemog']
-        self.hard_att_channel = kwargs['hard_att_channel']
-        self.hard_att_spatial = kwargs['hard_att_spatial']
-        self.lowresol_set = kwargs['lowresol_set']
+        hard_att_channel = kwargs['hard_att_channel']
+        hard_att_spatial = kwargs['hard_att_spatial']
+        lowresol_set = kwargs['lowresol_set']
         self.fuse_epoch = kwargs['fuse_epoch']
         
-        blocks = get_blocks(num_layers)
+        blocks = get_blocks(num_layers, self.ndemog, self.fuse_epoch,
+            {'use_spatial_att':use_spatial_att, 'hard_att_channel':hard_att_channel, \
+            'hard_att_spatial':hard_att_spatial, 'lowresol_set':lowresol_set})
         if mode == 'ir':
             unit_module = bottleneck_IR
         elif mode == 'ir_se':
@@ -290,18 +377,18 @@ class Backbone(Module):
         self.input_layer = Sequential(Conv2d(3, 64, (3, 3), 1, 1, bias=False),
                                       BatchNorm2d(64),
                                       PReLU(64))
-        if input_size[0] == 112:
-            self.output_layer = Sequential(BatchNorm2d(512),
-                                           Dropout(0.4),
-                                           Flatten(),
-                                           Linear(512 * 7 * 7, 512),
-                                           BatchNorm1d(512, affine=False))
-        else:
-            self.output_layer = Sequential(BatchNorm2d(512),
-                                           Dropout(0.4),
-                                           Flatten(),
-                                           Linear(512 * 14 * 14, 512),
-                                           BatchNorm1d(512, affine=False))
+        # if input_size[0] == 112:
+        self.output_layer = Sequential(BatchNorm2d(512),
+                                       Dropout(0.4),
+                                       Flatten(),
+                                       Linear(512 * 7 * 7, 512),
+                                       BatchNorm1d(512, affine=False))
+        # else:
+        #     self.output_layer = Sequential(BatchNorm2d(512),
+        #                                    Dropout(0.4),
+        #                                    Flatten(),
+        #                                    Linear(512 * 14 * 14, 512),
+        #                                    BatchNorm1d(512, affine=False))
 
         modules = []
         for block in blocks:
@@ -309,18 +396,27 @@ class Backbone(Module):
                 modules.append(
                     unit_module(bottleneck.in_channel,
                                 bottleneck.depth,
-                                bottleneck.stride))
+                                bottleneck.stride,
+                                bottleneck.ndemog, bottleneck.adap, bottleneck.fuse_epoch,
+                                bottleneck.use_att, bottleneck.height, bottleneck.width,
+                                bottleneck.use_spatial_att, bottleneck.hard_att_channel,
+                                bottleneck.hard_att_spatial, bottleneck.lowresol_set))
         self.body = Sequential(*modules)
 
         self._initialize_weights()
 
-    def forward(self, x):
+    def forward(self, inputs, epoch):
+        x = inputs[0]
+        demog_label = inputs[1]
         x = self.input_layer(x)
-        x = self.body(x)
+        x_dict = self.body({'x':x, 'demog_label':demog_label, 'epoch':epoch})
+        x = x_dict['x']
+        attc = [x_dict['attc']]
+        atts = [x_dict['atts']]
         conv_out = x.view(x.shape[0], -1)
         x = self.output_layer(x)
 
-        return x, conv_out
+        return x, {'attc':attc,'atts':atts}
 
     def _initialize_weights(self):
         for m in self.modules():
@@ -328,6 +424,10 @@ class Backbone(Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     m.bias.data.zero_()
+            if isinstance(m, AdaConv2d):
+                nn.init.xavier_normal_(m.kernel_base)
+                nn.init.xavier_normal_(m.kernel_mask)
+                nn.init.constant_(m.fuse_mark.data, val=0)
             elif isinstance(m, nn.BatchNorm2d):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
@@ -337,146 +437,25 @@ class Backbone(Module):
                     m.bias.data.zero_()
 
 
-def IR_50(input_size):
-    """Constructs a ir-50 model.
-    """
-    model = Backbone(input_size, 50, 'ir')
-
-    return model
-
-
-def IR_101(input_size):
-    """Constructs a ir-101 model.
-    """
-    model = Backbone(input_size, 100, 'ir')
-
-    return model
-
-
-def IR_152(input_size):
-    """Constructs a ir-152 model.
-    """
-    model = Backbone(input_size, 152, 'ir')
-
-    return model
-
-
-def IR_SE_50(input_size):
+def gac_IR_SE_50(**kwargs):
     """Constructs a ir_se-50 model.
     """
-    model = Backbone(input_size, 50, 'ir_se')
+    model = Backbone(50, 'ir_se', **kwargs)
 
     return model
 
 
-def IR_SE_101(input_size):
+def gac_IR_SE_101(**kwargs):
     """Constructs a ir_se-101 model.
     """
-    model = Backbone(input_size, 100, 'ir_se')
+    model = Backbone(100, 'ir_se', **kwargs)
 
     return model
 
 
-def IR_SE_152(input_size):
+def gac_IR_SE_152(**kwargs):
     """Constructs a ir_se-152 model.
     """
-    model = Backbone(input_size, 152, 'ir_se')
+    model = Backbone(152, 'ir_se', **kwargs)
 
     return model
-##################################  MobileFaceNet #############################################################
-    
-class Conv_block(Module):
-    def __init__(self, in_c, out_c, kernel=(1, 1), stride=(1, 1), padding=(0, 0), groups=1):
-        super(Conv_block, self).__init__()
-        self.conv = Conv2d(in_c, out_channels=out_c, kernel_size=kernel, groups=groups, stride=stride, padding=padding, bias=False)
-        self.bn = BatchNorm2d(out_c)
-        self.prelu = PReLU(out_c)
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.prelu(x)
-        return x
-
-class Linear_block(Module):
-    def __init__(self, in_c, out_c, kernel=(1, 1), stride=(1, 1), padding=(0, 0), groups=1):
-        super(Linear_block, self).__init__()
-        self.conv = Conv2d(in_c, out_channels=out_c, kernel_size=kernel, groups=groups, stride=stride, padding=padding, bias=False)
-        self.bn = BatchNorm2d(out_c)
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        return x
-
-class Depth_Wise(Module):
-     def __init__(self, in_c, out_c, residual = False, kernel=(3, 3), stride=(2, 2), padding=(1, 1), groups=1):
-        super(Depth_Wise, self).__init__()
-        self.conv = Conv_block(in_c, out_c=groups, kernel=(1, 1), padding=(0, 0), stride=(1, 1))
-        self.conv_dw = Conv_block(groups, groups, groups=groups, kernel=kernel, padding=padding, stride=stride)
-        self.project = Linear_block(groups, out_c, kernel=(1, 1), padding=(0, 0), stride=(1, 1))
-        self.residual = residual
-     def forward(self, x):
-        if self.residual:
-            short_cut = x
-        x = self.conv(x)
-        x = self.conv_dw(x)
-        x = self.project(x)
-        if self.residual:
-            output = short_cut + x
-        else:
-            output = x
-        return output
-
-class Residual(Module):
-    def __init__(self, c, num_block, groups, kernel=(3, 3), stride=(1, 1), padding=(1, 1)):
-        super(Residual, self).__init__()
-        modules = []
-        for _ in range(num_block):
-            modules.append(Depth_Wise(c, c, residual=True, kernel=kernel, padding=padding, stride=stride, groups=groups))
-        self.model = Sequential(*modules)
-    def forward(self, x):
-        return self.model(x)
-
-class MobileFaceNet(Module):
-    def __init__(self, embedding_size):
-        super(MobileFaceNet, self).__init__()
-        self.conv1 = Conv_block(3, 64, kernel=(3, 3), stride=(2, 2), padding=(1, 1))
-        self.conv2_dw = Conv_block(64, 64, kernel=(3, 3), stride=(1, 1), padding=(1, 1), groups=64)
-        self.conv_23 = Depth_Wise(64, 64, kernel=(3, 3), stride=(2, 2), padding=(1, 1), groups=128)
-        self.conv_3 = Residual(64, num_block=4, groups=128, kernel=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.conv_34 = Depth_Wise(64, 128, kernel=(3, 3), stride=(2, 2), padding=(1, 1), groups=256)
-        self.conv_4 = Residual(128, num_block=6, groups=256, kernel=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.conv_45 = Depth_Wise(128, 128, kernel=(3, 3), stride=(2, 2), padding=(1, 1), groups=512)
-        self.conv_5 = Residual(128, num_block=2, groups=256, kernel=(3, 3), stride=(1, 1), padding=(1, 1))
-        self.conv_6_sep = Conv_block(128, 512, kernel=(1, 1), stride=(1, 1), padding=(0, 0))
-        self.conv_6_dw = Linear_block(512, 512, groups=512, kernel=(7,7), stride=(1, 1), padding=(0, 0))
-        self.conv_6_flatten = Flatten()
-        self.linear = Linear(512, embedding_size, bias=False)
-        self.bn = BatchNorm1d(embedding_size)
-    
-    def forward(self, x):
-        out = self.conv1(x)
-
-        out = self.conv2_dw(out)
-
-        out = self.conv_23(out)
-
-        out = self.conv_3(out)
-        
-        out = self.conv_34(out)
-
-        out = self.conv_4(out)
-
-        out = self.conv_45(out)
-
-        out = self.conv_5(out)
-
-        out = self.conv_6_sep(out)
-
-        out = self.conv_6_dw(out)
-
-        out = self.conv_6_flatten(out)
-
-        out = self.linear(out)
-
-        out = self.bn(out)
-        return l2_norm(out)
