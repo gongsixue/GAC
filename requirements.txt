@@ -1,0 +1,4 @@
+torch>=1.6.0
+plotly>=2.2.3
+psutil>=5.4.1
+scikit-image>=0.13.1
